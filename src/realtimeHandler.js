@@ -26,7 +26,7 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 const DEFAULT_REALTIME_ENDPOINT =
-  process.env.OPENAI_REALTIME_ENDPOINT || 'wss://api.openai.com/v1/realtime?model=gpt-realtime';
+  process.env.OPENAI_REALTIME_ENDPOINT || 'wss://api.openai.com/v1/realtime?model=gpt-realtime-mini';
 
 
 export function attachRealtimeServer(server) {
@@ -416,7 +416,7 @@ export function connectToOpenAI() {
       type: 'session.update',
       session: {
         type: 'realtime',
-        model: 'gpt-realtime',
+        model: 'gpt-realtime-mini',
         output_modalities: ['audio'],
         audio: {
           input: {
@@ -449,6 +449,20 @@ export function connectToOpenAI() {
                 customerName: { type: 'string' },
                 customerPhone: { type: 'string' },
                 fulfillmentType: { type: 'string', enum: ['pickup', 'delivery'] },
+                deliveryAddress: {
+                  type: 'string',
+                  description: 'Full delivery street address including number and street name.',
+                },
+                deliveryApt: {
+                  type: 'string',
+                  description: 'Apartment, unit, or floor, if applicable.',
+                  nullable: true,
+                },
+                deliveryNotes: {
+                  type: 'string',
+                  description: 'Extra delivery notes or landmark info.',
+                  nullable: true,
+                },
                 items: {
                   type: 'array',
                   items: {
@@ -508,12 +522,26 @@ async function submitOrderToFirebase(orderPayload, restaurant) {
       return;
     }
 
+    const isDelivery = orderPayload.fulfillmentType === 'delivery';
+    const hasAddress = !!(orderPayload.deliveryAddress && orderPayload.deliveryAddress.trim());
+    if (isDelivery && !hasAddress) {
+      console.error('[Firebase] refusing to write delivery order without address', {
+        restaurantId,
+        customerName: orderPayload.customerName,
+        customerPhone: orderPayload.customerPhone,
+      });
+      return;
+    }
+
     const orderForFirestore = {
       restaurantId,
       restaurantName: restaurant?.name || "Joe's Pizza",
       customerName: orderPayload.customerName || 'Unknown',
       customerPhone: orderPayload.customerPhone || '',
       fulfillmentType: orderPayload.fulfillmentType || 'pickup',
+      deliveryAddress: orderPayload.deliveryAddress || null,
+      deliveryApt: orderPayload.deliveryApt || null,
+      deliveryNotes: orderPayload.deliveryNotes || null,
       source: 'voice',
       notes: orderPayload.notes || null,
       items: (orderPayload.items || []).map((item) => ({
