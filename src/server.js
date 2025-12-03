@@ -46,7 +46,6 @@ app.get('/health', (_req, res) => {
 app.post('/voice', async (req, res) => {
   const toNumber = req.body?.To;
   console.log('[Twilio] incoming /voice webhook', { to: toNumber });
-  console.log('[Config] TWILIO_STREAM_URL =', process.env.TWILIO_STREAM_URL);
 
   if (!toNumber) {
     console.error('[Twilio] missing To number in webhook payload');

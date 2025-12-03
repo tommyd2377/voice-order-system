@@ -24,6 +24,7 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
+const VERBOSE_OPENAI_LOGS = process.env.VERBOSE_OPENAI_LOGS === 'true';
 
 const DEFAULT_REALTIME_ENDPOINT =
   process.env.OPENAI_REALTIME_ENDPOINT || 'wss://api.openai.com/v1/realtime?model=gpt-realtime-mini';
@@ -119,6 +120,8 @@ export function attachRealtimeServer(server) {
         const sessionUpdate = {
           type: 'session.update',
           session: {
+            type: 'realtime',
+            model: 'gpt-realtime-mini',
             instructions: primaryPrompt,
           },
         };
@@ -158,7 +161,9 @@ export function attachRealtimeServer(server) {
         } else if (event === 'start' && message.start) {
           const sid = message.start.callSid || callSid || 'unknown';
           streamSid = message.start.streamSid || streamSid;
-          console.log(`[Realtime] event=start callSid=${sid}`);
+          if (VERBOSE_OPENAI_LOGS) {
+            console.log(`[Realtime] event=start callSid=${sid}`);
+          }
           if (!currentRestaurant && message.start.customParameters && message.start.customParameters.restaurantId) {
             const rid = message.start.customParameters.restaurantId;
             restaurantReady = loadRestaurantById(rid).then(() => {
@@ -167,12 +172,18 @@ export function attachRealtimeServer(server) {
           }
         } else if (event === 'mark' && message.mark) {
           const name = message.mark.name || 'unknown';
-          console.log(`[Realtime] event=mark name=${name}`);
+          if (VERBOSE_OPENAI_LOGS) {
+            console.log(`[Realtime] event=mark name=${name}`);
+          }
         } else if (event === 'stop') {
           const sid = callSid || 'unknown';
-          console.log(`[Realtime] event=stop callSid=${sid}`);
+          if (VERBOSE_OPENAI_LOGS) {
+            console.log(`[Realtime] event=stop callSid=${sid}`);
+          }
         } else {
-          console.log(`[Realtime] event=${event}`);
+          if (VERBOSE_OPENAI_LOGS) {
+            console.log(`[Realtime] event=${event}`);
+          }
         }
       } catch (err) {
         console.warn('[Realtime] Failed to parse Twilio message as JSON');
@@ -187,7 +198,9 @@ export function attachRealtimeServer(server) {
 
         // User has started speaking: cancel any in-flight response and stop audio.
         if (type === 'input_audio_buffer.speech_started') {
-          console.log('[OpenAI] event=input_audio_buffer.speech_started');
+          if (VERBOSE_OPENAI_LOGS) {
+            console.log('[OpenAI] event=input_audio_buffer.speech_started');
+          }
           userSpeaking = true;
 
           if (streamSid && socket.readyState === WebSocket.OPEN) {
@@ -226,11 +239,13 @@ export function attachRealtimeServer(server) {
           currentResponseId = message.response.id;
           activeResponse = true;
           userSpeaking = false; // model is now speaking
-          console.log('[OpenAI] event=response.created id=', currentResponseId);
+          if (VERBOSE_OPENAI_LOGS) {
+            console.log('[OpenAI] event=response.created id=', currentResponseId);
+          }
         }
 
         if (type === 'session.created' || type === 'session.updated') {
-          if (message.session) {
+          if (message.session && VERBOSE_OPENAI_LOGS) {
             console.log('[OpenAI] session state:', JSON.stringify(message.session, null, 2));
           }
         }
@@ -295,7 +310,6 @@ export function attachRealtimeServer(server) {
             (message.item && message.item.transcription);
           if (transcript) {
             orderLog.push({ from: 'user', text: String(transcript) });
-            console.log(`[OrderLog] user: ${transcript}`);
           }
         }
 
@@ -308,7 +322,6 @@ export function attachRealtimeServer(server) {
           assistantTextBuffer.trim()
         ) {
           orderLog.push({ from: 'assistant', text: assistantTextBuffer.trim() });
-          console.log(`[OrderLog] assistant: ${assistantTextBuffer.trim()}`);
           assistantTextBuffer = '';
         }
 
@@ -327,8 +340,6 @@ export function attachRealtimeServer(server) {
           // If user has started speaking or response is no longer active, stop sending audio.
           if (userSpeaking || !activeResponse) return;
 
-          console.log('[OpenAI] event=response.output_audio.delta');
-
           const twilioMedia = {
             event: 'media',
             streamSid,
@@ -344,11 +355,21 @@ export function attachRealtimeServer(server) {
           type === 'response.cancelled'
         ) {
           activeResponse = false;
-          console.log('[OpenAI] event=response.end type=', type);
+          if (VERBOSE_OPENAI_LOGS) {
+            console.log('[OpenAI] event=response.end type=', type);
+          }
         } else if (type === 'error') {
-          console.error('[OpenAI] error event payload:', JSON.stringify(message, null, 2));
+          if (message.error && message.error.code === 'response_cancel_not_active') {
+            if (VERBOSE_OPENAI_LOGS) {
+              console.log('[OpenAI] cancel_not_active (safe to ignore)');
+            }
+          } else {
+            console.error('[OpenAI] error event payload:', JSON.stringify(message, null, 2));
+          }
         } else {
-          console.log(`[OpenAI] event=${type}`);
+          if (VERBOSE_OPENAI_LOGS) {
+            console.log(`[OpenAI] event=${type}`);
+          }
         }
       } catch {
         console.warn('[OpenAI] Failed to parse message as JSON');
@@ -362,14 +383,14 @@ export function attachRealtimeServer(server) {
         `[Realtime] Twilio stream closed${callSid ? ` (CallSid=${callSid})` : ''}: code=${code} reason=${reasonText}`
       );
       console.log('[Order Tool Count]', submitOrderCount);
-        if (lastSubmitOrderPayload && !orderSubmitted) {
-          await restaurantReady;
-          console.log('[Order Tool Payload @ End]', JSON.stringify(lastSubmitOrderPayload, null, 2));
-          try {
-            console.log('[Order] Writing order to Firestore once', {
-              customerName: lastSubmitOrderPayload.customerName,
-              customerPhone: lastSubmitOrderPayload.customerPhone,
-              fulfillmentType: lastSubmitOrderPayload.fulfillmentType,
+      if (lastSubmitOrderPayload && !orderSubmitted) {
+        await restaurantReady;
+        console.log('[Order Tool Payload @ End]', JSON.stringify(lastSubmitOrderPayload, null, 2));
+        try {
+          console.log('[Order] Writing order to Firestore once', {
+            customerName: lastSubmitOrderPayload.customerName,
+            customerPhone: lastSubmitOrderPayload.customerPhone,
+            fulfillmentType: lastSubmitOrderPayload.fulfillmentType,
             });
             if (currentRestaurant) {
               await submitOrderToFirebase(lastSubmitOrderPayload, currentRestaurant);
@@ -377,10 +398,18 @@ export function attachRealtimeServer(server) {
             } else {
               console.error('[Order] missing restaurant context at call end; skipping Firestore write');
             }
-          } catch (err) {
-            console.error('[Firebase] order create wrapper failed', err);
-          }
+        } catch (err) {
+          console.error('[Firebase] order create wrapper failed', err);
         }
+      }
+      if (lastSubmitOrderPayload) {
+        console.log('[Call Summary]', {
+          restaurantId: currentRestaurant?.id || currentRestaurant?.restaurantId,
+          customerName: lastSubmitOrderPayload.customerName,
+          fulfillmentType: lastSubmitOrderPayload.fulfillmentType,
+          itemCount: Array.isArray(lastSubmitOrderPayload.items) ? lastSubmitOrderPayload.items.length : 0,
+        });
+      }
       if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
         openaiSocket.close();
       }
@@ -490,7 +519,9 @@ export function connectToOpenAI() {
   });
 
   ws.on('close', () => {
-    console.log('[OpenAI] closed');
+    if (VERBOSE_OPENAI_LOGS) {
+      console.log('[OpenAI] closed');
+    }
   });
 
   ws.on('error', (error) => {
