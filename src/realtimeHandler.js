@@ -25,6 +25,56 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 const VERBOSE_OPENAI_LOGS = process.env.VERBOSE_OPENAI_LOGS === 'true';
+const BASE_INSTRUCTIONS = `
+You are the automated phone ordering assistant for {{RESTAURANT_NAME}}, a {{RESTAURANT_DESCRIPTION}}. You answer calls, take food orders, and enter them accurately into the system.
+
+GLOBAL STYLE
+- Be concise and transactional; keep turns short.
+- Use simple, natural language, not corporate or robotic.
+- Ask only for information needed to place the order.
+- No small talk, no jokes, no stories.
+- Never explain that you are an AI unless the caller directly asks.
+
+CALL OPENING (DO THIS ONCE AT THE VERY START)
+At the beginning of the call, before asking anything else, say exactly:
+"Thanks for calling {{RESTAURANT_NAME}}. I'm the automated assistant. Are you ordering for pickup or delivery?"
+Then stop and wait for the caller's answer.
+Do not repeat this greeting later in the call.
+
+CALL FLOW
+1. Determine pickup vs delivery.
+   - For pickup: ask for the customer's name and phone number at some natural point early in the call.
+   - For delivery: ask for name, phone number, and full delivery address (including apartment/floor if needed). If any address detail is unclear, ask a short follow-up question.
+
+2. Take the order items.
+   - Ask what they'd like to order.
+   - Capture each item's name, quantity, and any options or notes (sauce, spice level, sides, etc.).
+   - If something is ambiguous, ask a brief clarifying question.
+   - Keep each response to 1-2 short sentences.
+
+3. Confirm the order.
+   - Read back a compact summary: items, pickup vs delivery, and any key notes.
+   - If there is a total price provided to you, confirm it; if not, do NOT invent prices.
+   - Ask "Is everything correct?" and wait for the caller to confirm or correct.
+
+TOOL USE: submit_order
+- When the order is fully confirmed and you have:
+  - customer name
+  - customer phone
+  - fulfillment type (pickup or delivery)
+  - delivery address for delivery orders
+  - all items with quantities and notes
+- Then call the submit_order tool exactly once with the final data.
+- Do not call submit_order before the order is confirmed.
+- Do not call submit_order multiple times unless the caller clearly places a second, separate order.
+
+AFTER TOOL CALL
+- After the tool responds, give ONE short confirmation sentence such as:
+  "Your pickup order for [brief summary] is placed. It'll be ready in about [time if known or given]."
+- For delivery: "Your delivery order to [street or landmark only, not full address] is placed."
+- Do not ask new questions after the final confirmation.
+- End the call politely and succinctly, e.g., "Thank you for calling {{RESTAURANT_NAME}}."
+`.trim();
 
 const DEFAULT_REALTIME_ENDPOINT =
   process.env.OPENAI_REALTIME_ENDPOINT || 'wss://api.openai.com/v1/realtime?model=gpt-realtime-mini';
@@ -43,6 +93,7 @@ export function attachRealtimeServer(server) {
     console.log(`[Realtime] Twilio stream connected${callSid ? ` for CallSid=${callSid}` : ''}`);
 
     let currentRestaurant = null;
+    let orderCompleted = false;
 
     const loadRestaurantById = async (restaurantIdParam) => {
       if (!restaurantIdParam) {
@@ -107,36 +158,38 @@ export function attachRealtimeServer(server) {
     openaiSocket.on('open', async () => {
       await restaurantReady;
 
-      const primaryPrompt = currentRestaurant?.primaryPrompt;
-      const initialGreeting = currentRestaurant?.initialResponseInstructions;
+      const restaurantName = currentRestaurant?.name || 'the restaurant';
+      const description =
+        (currentRestaurant?.shortDescription || 'neighborhood restaurant and takeout spot').trim();
+      const instructions = BASE_INSTRUCTIONS.replaceAll('{{RESTAURANT_NAME}}', restaurantName).replaceAll(
+        '{{RESTAURANT_DESCRIPTION}}',
+        description
+      );
 
-      console.log('[Realtime] applying restaurant-specific prompt', {
+      console.log('[Realtime] applying restaurant instructions', {
         restaurantId: currentRestaurant?.id,
-        hasPrimaryPrompt: !!currentRestaurant?.primaryPrompt,
-        hasInitialGreeting: !!currentRestaurant?.initialResponseInstructions,
+        restaurantName,
       });
 
-      if (primaryPrompt) {
-        const sessionUpdate = {
-          type: 'session.update',
-          session: {
-            type: 'realtime',
-            model: 'gpt-realtime-mini',
-            instructions: primaryPrompt,
-          },
-        };
-        openaiSocket.send(JSON.stringify(sessionUpdate));
-      }
+      const sessionUpdate = {
+        type: 'session.update',
+        session: {
+          type: 'realtime',
+          model: 'gpt-realtime-mini',
+          instructions,
+        },
+      };
+      openaiSocket.send(JSON.stringify(sessionUpdate));
 
-      if (initialGreeting) {
-        const initialResponse = {
+      const greetingText = `Thanks for calling ${restaurantName}. I'm the automated assistant. Are you ordering for pickup or delivery?`;
+      openaiSocket.send(
+        JSON.stringify({
           type: 'response.create',
           response: {
-            instructions: initialGreeting,
+            instructions: `Start the call by saying exactly: "${greetingText}" Then stop and wait for the caller's answer before saying anything else.`,
           },
-        };
-        openaiSocket.send(JSON.stringify(initialResponse));
-      }
+        })
+      );
     });
 
     socket.on('message', (data, isBinary) => {
@@ -269,6 +322,7 @@ export function attachRealtimeServer(server) {
               const payload = JSON.parse(finalArgs);
               lastSubmitOrderPayload = payload;
               submitOrderCount += 1;
+              orderCompleted = true;
               console.log('[Order Tool Payload]', JSON.stringify(payload, null, 2));
               if (!currentRestaurant) {
                 console.error('[Order Tool Payload] missing restaurant context; skipping Firestore write');
@@ -284,9 +338,21 @@ export function attachRealtimeServer(server) {
                     output: JSON.stringify(payload),
                   },
                 };
+                const confirmationText = `Confirm once in a single short sentence the ${
+                  payload.fulfillmentType || 'pickup'
+                } order is placed${
+                  payload.deliveryAddress ? ` to ${payload.deliveryAddress}` : ''
+                }. No extra questions.`;
                 try {
                   openaiSocket.send(JSON.stringify(toolOutput));
-                  openaiSocket.send(JSON.stringify({ type: 'response.create' }));
+                  openaiSocket.send(
+                    JSON.stringify({
+                      type: 'response.create',
+                      response: {
+                        instructions: confirmationText,
+                      },
+                    })
+                  );
                 } catch (err) {
                   console.warn('[Order Tool Payload] failed to send tool output', err);
                 }
@@ -441,12 +507,18 @@ export function connectToOpenAI() {
   ws.on('open', () => {
     console.log('[OpenAI] connected');
 
+    const fallbackInstructions = BASE_INSTRUCTIONS.replaceAll(
+      '{{RESTAURANT_NAME}}',
+      'the restaurant'
+    ).replaceAll('{{RESTAURANT_DESCRIPTION}}', 'neighborhood restaurant and takeout spot');
+
     const sessionUpdate = {
       type: 'session.update',
       session: {
         type: 'realtime',
         model: 'gpt-realtime-mini',
         output_modalities: ['audio'],
+        instructions: fallbackInstructions,
         audio: {
           input: {
             format: { type: 'audio/pcmu' },
@@ -456,8 +528,8 @@ export function connectToOpenAI() {
             turn_detection: {
               type: 'server_vad',
               threshold: 0.35,
-              prefix_padding_ms: 200,
-              silence_duration_ms: 250,
+              prefix_padding_ms: 120,
+              silence_duration_ms: 150,
               create_response: true,
               interrupt_response: true,
             },
