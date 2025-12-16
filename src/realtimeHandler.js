@@ -1,5 +1,6 @@
 import WebSocket, { WebSocketServer } from 'ws';
 import { createRequire } from 'module';
+import { randomUUID } from 'crypto';
 import { connectGeminiLive } from './geminiLiveClient.js';
 
 const require = createRequire(import.meta.url);
@@ -25,7 +26,10 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
-const VERBOSE_GEMINI_LOGS = process.env.VERBOSE_GEMINI_LOGS === 'true';
+const DEBUG_TWILIO_STREAM = process.env.DEBUG_TWILIO_STREAM === 'true';
+const DEBUG_GEMINI_EVENTS = process.env.DEBUG_GEMINI_EVENTS === 'true';
+const DEBUG_AUDIO_STATS = process.env.DEBUG_AUDIO_STATS === 'true';
+const VERBOSE_GEMINI_LOGS = DEBUG_GEMINI_EVENTS || process.env.VERBOSE_GEMINI_LOGS === 'true';
 const DEFAULT_AUDIO_MIME_TYPE = 'audio/pcm;rate=8000';
 const BASE_INSTRUCTIONS = `
 You are the automated phone ordering assistant for {{RESTAURANT_NAME}}, a {{RESTAURANT_DESCRIPTION}}. You answer calls, take food orders, and enter them accurately into the system.
@@ -120,6 +124,23 @@ const SUBMIT_ORDER_TOOL = {
   },
 };
 
+const SENSITIVE_HEADER_KEYS = ['authorization', 'cookie', 'x-twilio-signature', 'twilio-signature'];
+function sanitizeHeaders(headers = {}) {
+  return Object.entries(headers || {}).reduce((acc, [key, value]) => {
+    if (SENSITIVE_HEADER_KEYS.includes(String(key).toLowerCase())) {
+      acc[key] = '[redacted]';
+    } else {
+      acc[key] = value;
+    }
+    return acc;
+  }, {});
+}
+
+function base64Preview(payload, length = 16) {
+  if (!payload || typeof payload !== 'string') return '';
+  return payload.slice(0, length);
+}
+
 
 export function attachRealtimeServer(server) {
   const wss = new WebSocketServer({ server, path: '/realtime' });
@@ -130,10 +151,59 @@ export function attachRealtimeServer(server) {
 
   wss.on('connection', (socket, request) => {
     const callSid = request.headers['x-twilio-call-sid'];
-    console.log('Twilio stream connected');
-    console.log(`[Realtime] Twilio stream connected${callSid ? ` for CallSid=${callSid}` : ''}`);
+    const callTraceId = callSid || randomUUID();
+    let streamSid = request.headers['x-twilio-stream-id'] || null;
+    const twilioPrefix = `[Twilio][callSid=${callSid || 'unknown'}][trace=${callTraceId}]`;
+    const sanitizedHeaders = sanitizeHeaders(request.headers || {});
+    console.log(`${twilioPrefix} WebSocket connected`, {
+      streamSid: streamSid || 'unknown',
+      url: request.url,
+      headers: sanitizedHeaders,
+    });
 
     let currentRestaurant = null;
+    let twilioMediaFrames = 0;
+    let firstMediaAtMs = null;
+    let startReceivedAtMs = null;
+    let noMediaWarningTimeout = null;
+    let streamClosed = false;
+    let currentResponseId = 0;
+    let lastCancelAck = false;
+    let lastCancelRequestedAt = null;
+
+    const bargePrefix = `[BARGE-IN][trace=${callTraceId}]`;
+    const toolPrefix = `[TOOL][submit_order][trace=${callTraceId}]`;
+
+    const twilioLog = (level, message, meta) => {
+      const streamSuffix = streamSid ? `[streamSid=${streamSid}]` : '';
+      const line = `${twilioPrefix}${streamSuffix} ${message}`;
+      if (meta !== undefined) {
+        if (level === 'warn') {
+          console.warn(line, meta);
+        } else if (level === 'error') {
+          console.error(line, meta);
+        } else {
+          console.log(line, meta);
+        }
+      } else if (level === 'warn') {
+        console.warn(line);
+      } else if (level === 'error') {
+        console.error(line);
+      } else {
+        console.log(line);
+      }
+    };
+
+    const scheduleNoMediaWarning = () => {
+      if (noMediaWarningTimeout) {
+        clearTimeout(noMediaWarningTimeout);
+      }
+      noMediaWarningTimeout = setTimeout(() => {
+        if (twilioMediaFrames === 0 && !streamClosed) {
+          twilioLog('warn', 'No media frames received within 500ms after start');
+        }
+      }, 500);
+    };
 
     const loadRestaurantById = async (restaurantIdParam) => {
       if (!restaurantIdParam) {
@@ -175,7 +245,6 @@ export function attachRealtimeServer(server) {
       }
     })();
 
-    let streamSid = null;
     let userSpeaking = false;
     let lastSubmitOrderPayload = null;
     let submitOrderCount = 0;
@@ -187,6 +256,9 @@ export function attachRealtimeServer(server) {
 
     const handleBargeIn = async () => {
       userSpeaking = true;
+      const bargeTimestamp = new Date().toISOString();
+      let twilioClearSent = false;
+      let geminiCancelRequested = false;
 
       if (streamSid && socket.readyState === WebSocket.OPEN) {
         try {
@@ -196,18 +268,34 @@ export function attachRealtimeServer(server) {
               streamSid,
             })
           );
-          console.log('[Realtime] sent clear event to Twilio');
+          twilioClearSent = true;
+          console.log(`${bargePrefix} sent clear event to Twilio`, {
+            timestamp: bargeTimestamp,
+            streamSid,
+            currentResponseId,
+          });
         } catch (err) {
-          console.warn('[Realtime] failed to send clear event to Twilio', err);
+          console.warn(`${bargePrefix} failed to send clear event to Twilio`, err);
         }
       }
 
       try {
         const client = geminiClient || (await geminiClientPromise);
         client?.cancelResponse();
+        geminiCancelRequested = true;
+        lastCancelAck = false;
+        lastCancelRequestedAt = Date.now();
       } catch (err) {
-        console.warn('[Gemini] failed to cancel active response', err);
+        console.warn(`${bargePrefix} failed to cancel active response`, err);
       }
+
+      console.log(`${bargePrefix} barge-in`, {
+        timestamp: bargeTimestamp,
+        currentResponseId,
+        twilioClearSent,
+        geminiCancelRequested,
+        geminiCancelAcked: lastCancelAck,
+      });
     };
 
     const wireGeminiEvents = (client) => {
@@ -241,11 +329,19 @@ export function attachRealtimeServer(server) {
           orderLog.push({ from: 'assistant', text: finalText });
         }
         assistantTextBuffer = '';
+        currentResponseId += 1;
       });
 
       client.on('response.complete', () => {});
 
-      client.on('response.interrupted', () => {});
+      client.on('response.interrupted', () => {
+        lastCancelAck = true;
+        console.log(`${bargePrefix} Gemini cancel acknowledged`, {
+          currentResponseId,
+          requestedAt: lastCancelRequestedAt,
+          acknowledgedAt: new Date().toISOString(),
+        });
+      });
 
       client.on('transcript.completed', ({ text }) => {
         if (text) {
@@ -257,17 +353,24 @@ export function attachRealtimeServer(server) {
         if (name !== 'submit_order') {
           return;
         }
+        const argSize = argumentsJsonString ? argumentsJsonString.length : 0;
+        console.log(`${toolPrefix} arguments received`, { callId: callId || null, argSize });
         try {
           await restaurantReady;
           const payload = JSON.parse(argumentsJsonString || '{}');
           lastSubmitOrderPayload = payload;
           submitOrderCount += 1;
-          console.log('[Order Tool Payload]', JSON.stringify(payload, null, 2));
+          console.log(`${toolPrefix} arguments parsed`, {
+            keys: Object.keys(payload || {}),
+            itemCount: Array.isArray(payload?.items) ? payload.items.length : 0,
+          });
+          console.log(`${toolPrefix} finalized payload`, JSON.stringify(payload, null, 2));
           if (!currentRestaurant) {
             console.error('[Order Tool Payload] missing restaurant context; skipping Firestore write');
           }
 
           if (callId) {
+            console.log(`${toolPrefix} sending tool response to Gemini`, { callId });
             client.sendToolResponse({
               callId,
               name,
@@ -280,7 +383,7 @@ export function attachRealtimeServer(server) {
           } order is placed${payload.deliveryAddress ? ` to ${payload.deliveryAddress}` : ''}. No extra questions.`;
           client.sendTextPrompt(confirmationText);
         } catch (err) {
-          console.warn('[Order Tool Payload] failed to parse arguments', err);
+          console.warn(`${toolPrefix} failed to parse arguments`, err);
         }
       });
 
@@ -312,6 +415,9 @@ export function attachRealtimeServer(server) {
           audioFormat: DEFAULT_AUDIO_MIME_TYPE,
           tools: [SUBMIT_ORDER_TOOL],
           greetingText,
+          callSid,
+          callTraceId,
+          restaurantId: currentRestaurant?.id || null,
         });
 
         if (!geminiClient) {
@@ -336,56 +442,104 @@ export function attachRealtimeServer(server) {
 
         const event = message.event || 'unknown';
 
+        if (event === 'start' && message.start) {
+          startReceivedAtMs = Date.now();
+          const sid = message.start.callSid || callSid || 'unknown';
+          streamSid = message.start.streamSid || streamSid;
+          const customParameters = message.start.customParameters || {};
+          twilioLog('log', 'start event received', {
+            start: message.start,
+            customParameters,
+            detectedRestaurantId: customParameters.restaurantId || null,
+            callTraceId,
+          });
+          scheduleNoMediaWarning();
+          if (!currentRestaurant && customParameters.restaurantId) {
+            const rid = customParameters.restaurantId;
+            restaurantReady = loadRestaurantById(rid).then(() => {
+              twilioLog('log', 'restaurant loaded from start.customParameters', { restaurantId: rid });
+            });
+          }
+          if (!geminiClientPromise) {
+            geminiClientPromise = initializeGemini();
+          }
+          return;
+        }
+
         if (event === 'media' && message.media) {
           if (!geminiClientPromise) {
             geminiClientPromise = initializeGemini();
           }
-          if (message.media.payload) {
-            const payload = message.media.payload;
+          const payload = message.media.payload || '';
+          const seq = message.media.sequenceNumber ?? 'n/a';
+          twilioMediaFrames += 1;
+          if (!firstMediaAtMs) {
+            firstMediaAtMs = Date.now();
+          }
+          if (noMediaWarningTimeout) {
+            clearTimeout(noMediaWarningTimeout);
+            noMediaWarningTimeout = null;
+          }
+          const payloadBytes = payload ? Buffer.from(payload, 'base64').length : 0;
+          if (!streamSid && message.streamSid) {
+            streamSid = message.streamSid;
+          }
+          if (DEBUG_TWILIO_STREAM || DEBUG_AUDIO_STATS) {
+            twilioLog('log', `media frame ${twilioMediaFrames}`, {
+              sequenceNumber: seq,
+              payloadBytes,
+              payloadPrefix: base64Preview(payload),
+            });
+          } else if (twilioMediaFrames === 1) {
+            twilioLog('log', 'first media frame received', { sequenceNumber: seq, payloadBytes });
+          }
+          if (payload) {
             geminiClientPromise?.then((client) => {
               client?.sendAudioChunk(payload);
             });
           }
-        } else if (event === 'start' && message.start) {
-          const sid = message.start.callSid || callSid || 'unknown';
-          streamSid = message.start.streamSid || streamSid;
-          if (VERBOSE_GEMINI_LOGS) {
-            console.log(`[Realtime] event=start callSid=${sid}`);
-          }
-          if (!currentRestaurant && message.start.customParameters && message.start.customParameters.restaurantId) {
-            const rid = message.start.customParameters.restaurantId;
-            restaurantReady = loadRestaurantById(rid).then(() => {
-              console.log('[Realtime] restaurant loaded from start.customParameters', { restaurantId: rid });
-            });
-          }
-          if (!geminiClientPromise) {
-            geminiClientPromise = initializeGemini();
-          }
-        } else if (event === 'mark' && message.mark) {
+          return;
+        }
+
+        if (event === 'mark' && message.mark) {
           const name = message.mark.name || 'unknown';
-          if (VERBOSE_GEMINI_LOGS) {
-            console.log(`[Realtime] event=mark name=${name}`);
-          }
-        } else if (event === 'stop') {
-          const sid = callSid || 'unknown';
-          if (VERBOSE_GEMINI_LOGS) {
-            console.log(`[Realtime] event=stop callSid=${sid}`);
-          }
-        } else {
-          if (VERBOSE_GEMINI_LOGS) {
-            console.log(`[Realtime] event=${event}`);
-          }
+          twilioLog('log', 'mark event', { name });
+          return;
+        }
+
+        if (event === 'stop') {
+          const reason = message.stop?.reason || 'unknown';
+          twilioLog('log', 'stop event received', {
+            reason,
+            totalFrames: twilioMediaFrames,
+            firstMediaAtMs,
+          });
+          return;
+        }
+
+        if (VERBOSE_GEMINI_LOGS || DEBUG_TWILIO_STREAM) {
+          twilioLog('log', `event=${event}`);
         }
       } catch (err) {
-        console.warn('[Realtime] Failed to parse Twilio message as JSON');
+        twilioLog('warn', 'Failed to parse Twilio message as JSON', { error: err?.message });
       }
     });
     socket.on('close', async (code, reason) => {
+      streamClosed = true;
+      if (noMediaWarningTimeout) {
+        clearTimeout(noMediaWarningTimeout);
+      }
       const reasonText = normalizeReason(reason);
-      console.log('Twilio stream closed');
-      console.log(
-        `[Realtime] Twilio stream closed${callSid ? ` (CallSid=${callSid})` : ''}: code=${code} reason=${reasonText}`
-      );
+      twilioLog('log', 'Twilio stream closed', {
+        code,
+        reason: reasonText,
+        totalFrames: twilioMediaFrames,
+        firstMediaAtMs,
+        startReceivedAtMs,
+      });
+      if (twilioMediaFrames === 0) {
+        twilioLog('warn', 'Stream closed before any media was received');
+      }
       console.log('[Order Tool Count]', submitOrderCount);
       if (lastSubmitOrderPayload && !orderSubmitted) {
         await restaurantReady;
@@ -397,7 +551,7 @@ export function attachRealtimeServer(server) {
             fulfillmentType: lastSubmitOrderPayload.fulfillmentType,
             });
             if (currentRestaurant) {
-              await submitOrderToFirebase(lastSubmitOrderPayload, currentRestaurant);
+              await submitOrderToFirebase(lastSubmitOrderPayload, currentRestaurant, callTraceId);
               orderSubmitted = true;
             } else {
               console.error('[Order] missing restaurant context at call end; skipping Firestore write');
@@ -422,7 +576,7 @@ export function attachRealtimeServer(server) {
     });
 
     socket.on('error', (error) => {
-      console.error(`[Realtime] Twilio stream error${callSid ? ` (CallSid=${callSid})` : ''}:`, error);
+      twilioLog('error', 'Twilio stream error', { error });
     });
   });
 }
@@ -441,18 +595,19 @@ function normalizeReason(reason) {
   return 'unknown';
 }
 
-async function submitOrderToFirebase(orderPayload, restaurant) {
+async function submitOrderToFirebase(orderPayload, restaurant, callTraceId = null) {
+  const submitPrefix = callTraceId ? `[TOOL][submit_order][trace=${callTraceId}]` : '[TOOL][submit_order]';
   try {
     const restaurantId = restaurant?.id || restaurant?.restaurantId;
     if (!restaurantId) {
-      console.error('[Firebase] missing restaurantId; not writing order');
+      console.error(`${submitPrefix} missing restaurantId; not writing order`);
       return;
     }
 
     const isDelivery = orderPayload.fulfillmentType === 'delivery';
     const hasAddress = !!(orderPayload.deliveryAddress && orderPayload.deliveryAddress.trim());
     if (isDelivery && !hasAddress) {
-      console.error('[Firebase] refusing to write delivery order without address', {
+      console.error(`${submitPrefix} refusing to write delivery order without address`, {
         restaurantId,
         customerName: orderPayload.customerName,
         customerPhone: orderPayload.customerPhone,
@@ -488,9 +643,15 @@ async function submitOrderToFirebase(orderPayload, restaurant) {
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
+    console.log(`${submitPrefix} Firestore write start`, {
+      restaurantId,
+      customerName: orderPayload.customerName,
+      fulfillmentType: orderPayload.fulfillmentType,
+      itemCount: Array.isArray(orderPayload.items) ? orderPayload.items.length : 0,
+    });
     const docRef = await db.collection('orders').add(orderForFirestore);
-    console.log('[Firebase] order created', docRef.id);
+    console.log(`${submitPrefix} Firestore write success`, { orderId: docRef.id });
   } catch (err) {
-    console.error('[Firebase] order create failed', err);
+    console.error(`${submitPrefix} Firestore write failed`, err);
   }
 }
