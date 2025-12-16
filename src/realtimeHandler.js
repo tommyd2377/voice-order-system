@@ -1,5 +1,6 @@
 import WebSocket, { WebSocketServer } from 'ws';
 import { createRequire } from 'module';
+import { connectGeminiLive } from './geminiLiveClient.js';
 
 const require = createRequire(import.meta.url);
 const admin = require('firebase-admin');
@@ -24,7 +25,8 @@ if (!admin.apps.length) {
 }
 
 const db = admin.firestore();
-const VERBOSE_OPENAI_LOGS = process.env.VERBOSE_OPENAI_LOGS === 'true';
+const VERBOSE_GEMINI_LOGS = process.env.VERBOSE_GEMINI_LOGS === 'true';
+const DEFAULT_AUDIO_MIME_TYPE = 'audio/pcm;rate=8000';
 const BASE_INSTRUCTIONS = `
 You are the automated phone ordering assistant for {{RESTAURANT_NAME}}, a {{RESTAURANT_DESCRIPTION}}. You answer calls, take food orders, and enter them accurately into the system.
 
@@ -75,9 +77,48 @@ AFTER TOOL CALL
 - Do not ask new questions after the final confirmation.
 - End the call politely and succinctly, e.g., "Thank you for calling {{RESTAURANT_NAME}}."
 `.trim();
-
-const DEFAULT_REALTIME_ENDPOINT =
-  process.env.OPENAI_REALTIME_ENDPOINT || 'wss://api.openai.com/v1/realtime?model=gpt-realtime-mini';
+const SUBMIT_ORDER_TOOL = {
+  name: 'submit_order',
+  description: 'Submit a confirmed order from this phone call.',
+  parametersJsonSchema: {
+    type: 'object',
+    properties: {
+      customerName: { type: 'string' },
+      customerPhone: { type: 'string' },
+      fulfillmentType: { type: 'string', enum: ['pickup', 'delivery'] },
+      deliveryAddress: {
+        type: 'string',
+        description: 'Full delivery street address including number and street name.',
+      },
+      deliveryApt: {
+        type: 'string',
+        description: 'Apartment, unit, or floor, if applicable.',
+        nullable: true,
+      },
+      deliveryNotes: {
+        type: 'string',
+        description: 'Extra delivery notes or landmark info.',
+        nullable: true,
+      },
+      items: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            name: { type: 'string' },
+            quantity: { type: 'number' },
+            notes: { type: 'string' },
+          },
+          required: ['name', 'quantity'],
+          additionalProperties: false,
+        },
+      },
+      notes: { type: 'string' },
+    },
+    required: ['customerName', 'customerPhone', 'fulfillmentType', 'items'],
+    additionalProperties: false,
+  },
+};
 
 
 export function attachRealtimeServer(server) {
@@ -93,7 +134,6 @@ export function attachRealtimeServer(server) {
     console.log(`[Realtime] Twilio stream connected${callSid ? ` for CallSid=${callSid}` : ''}`);
 
     let currentRestaurant = null;
-    let orderCompleted = false;
 
     const loadRestaurantById = async (restaurantIdParam) => {
       if (!restaurantIdParam) {
@@ -135,62 +175,159 @@ export function attachRealtimeServer(server) {
       }
     })();
 
-    const openaiSocket = connectToOpenAI();
-    if (!openaiSocket) {
-      console.error('[OpenAI] Failed to create OpenAI WebSocket; closing Twilio stream');
-      socket.close();
-      return;
-    }
-
     let streamSid = null;
-    let activeResponse = false;
-    let currentResponseId = null;
     let userSpeaking = false;
-    let functionCallBuffer = '';
-    let functionCallName = null;
-    let functionCallId = null;
     let lastSubmitOrderPayload = null;
     let submitOrderCount = 0;
     let orderSubmitted = false;
     let assistantTextBuffer = '';
+    let geminiClient = null;
+    let geminiClientPromise = null;
     const orderLog = [];
 
-    openaiSocket.on('open', async () => {
-      await restaurantReady;
+    const handleBargeIn = async () => {
+      userSpeaking = true;
 
-      const restaurantName = currentRestaurant?.name || 'the restaurant';
-      const description =
-        (currentRestaurant?.shortDescription || 'neighborhood restaurant and takeout spot').trim();
-      const instructions = BASE_INSTRUCTIONS.replaceAll('{{RESTAURANT_NAME}}', restaurantName).replaceAll(
-        '{{RESTAURANT_DESCRIPTION}}',
-        description
-      );
+      if (streamSid && socket.readyState === WebSocket.OPEN) {
+        try {
+          socket.send(
+            JSON.stringify({
+              event: 'clear',
+              streamSid,
+            })
+          );
+          console.log('[Realtime] sent clear event to Twilio');
+        } catch (err) {
+          console.warn('[Realtime] failed to send clear event to Twilio', err);
+        }
+      }
 
-      console.log('[Realtime] applying restaurant instructions', {
-        restaurantId: currentRestaurant?.id,
-        restaurantName,
+      try {
+        const client = geminiClient || (await geminiClientPromise);
+        client?.cancelResponse();
+      } catch (err) {
+        console.warn('[Gemini] failed to cancel active response', err);
+      }
+    };
+
+    const wireGeminiEvents = (client) => {
+      client.on('user.start', () => {
+        handleBargeIn();
       });
 
-      const sessionUpdate = {
-        type: 'session.update',
-        session: {
-          type: 'realtime',
-          model: 'gpt-realtime-mini',
-          instructions,
-        },
-      };
-      openaiSocket.send(JSON.stringify(sessionUpdate));
+      client.on('audio.delta', ({ chunk }) => {
+        if (!chunk || !streamSid) return;
+        if (userSpeaking) return;
+        userSpeaking = false;
+        const twilioMedia = {
+          event: 'media',
+          streamSid,
+          media: { payload: chunk },
+        };
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify(twilioMedia));
+        }
+      });
 
-      const greetingText = `Thanks for calling ${restaurantName}. I'm the automated assistant. Are you ordering for pickup or delivery?`;
-      openaiSocket.send(
-        JSON.stringify({
-          type: 'response.create',
-          response: {
-            instructions: `Start the call by saying exactly: "${greetingText}" Then stop and wait for the caller's answer before saying anything else.`,
-          },
-        })
-      );
-    });
+      client.on('text.delta', ({ text }) => {
+        if (text) {
+          assistantTextBuffer += text;
+        }
+      });
+
+      client.on('text.done', ({ text }) => {
+        const finalText = (text || assistantTextBuffer || '').trim();
+        if (finalText) {
+          orderLog.push({ from: 'assistant', text: finalText });
+        }
+        assistantTextBuffer = '';
+      });
+
+      client.on('response.complete', () => {});
+
+      client.on('response.interrupted', () => {});
+
+      client.on('transcript.completed', ({ text }) => {
+        if (text) {
+          orderLog.push({ from: 'user', text: String(text) });
+        }
+      });
+
+      client.on('tool.call', async ({ name, callId, argumentsJsonString }) => {
+        if (name !== 'submit_order') {
+          return;
+        }
+        try {
+          await restaurantReady;
+          const payload = JSON.parse(argumentsJsonString || '{}');
+          lastSubmitOrderPayload = payload;
+          submitOrderCount += 1;
+          console.log('[Order Tool Payload]', JSON.stringify(payload, null, 2));
+          if (!currentRestaurant) {
+            console.error('[Order Tool Payload] missing restaurant context; skipping Firestore write');
+          }
+
+          if (callId) {
+            client.sendToolResponse({
+              callId,
+              name,
+              response: payload,
+            });
+          }
+
+          const confirmationText = `Confirm once in a single short sentence the ${
+            payload.fulfillmentType || 'pickup'
+          } order is placed${payload.deliveryAddress ? ` to ${payload.deliveryAddress}` : ''}. No extra questions.`;
+          client.sendTextPrompt(confirmationText);
+        } catch (err) {
+          console.warn('[Order Tool Payload] failed to parse arguments', err);
+        }
+      });
+
+      client.on('error', (err) => {
+        console.error('[Gemini] error event payload:', err);
+      });
+    };
+
+    const initializeGemini = async () => {
+      try {
+        await restaurantReady;
+        const restaurantName = currentRestaurant?.name || 'the restaurant';
+        const description =
+          (currentRestaurant?.shortDescription || 'neighborhood restaurant and takeout spot').trim();
+        const instructions = BASE_INSTRUCTIONS.replaceAll(
+          '{{RESTAURANT_NAME}}',
+          restaurantName
+        ).replaceAll('{{RESTAURANT_DESCRIPTION}}', description);
+        const greetingText = `Thanks for calling ${restaurantName}. I'm the automated assistant. Are you ordering for pickup or delivery?`;
+
+        console.log('[Realtime] applying restaurant instructions', {
+          restaurantId: currentRestaurant?.id,
+          restaurantName,
+        });
+
+        geminiClient = await connectGeminiLive({
+          instructions,
+          voice: process.env.GEMINI_LIVE_VOICE,
+          audioFormat: DEFAULT_AUDIO_MIME_TYPE,
+          tools: [SUBMIT_ORDER_TOOL],
+          greetingText,
+        });
+
+        if (!geminiClient) {
+          console.error('[Gemini] Failed to create Gemini Live session; closing Twilio stream');
+          socket.close();
+          return null;
+        }
+
+        wireGeminiEvents(geminiClient);
+        return geminiClient;
+      } catch (err) {
+        console.error('[Gemini] failed to initialize Gemini Live client', err);
+        socket.close();
+        return null;
+      }
+    };
 
     socket.on('message', (data, isBinary) => {
       try {
@@ -200,21 +337,19 @@ export function attachRealtimeServer(server) {
         const event = message.event || 'unknown';
 
         if (event === 'media' && message.media) {
-          const seq = message.sequenceNumber ?? message.media.sequenceNumber;
-          const chunk = message.media.chunk ? message.media.chunk : message.media.chunkNumber;
-
-          if (message.media.payload && openaiSocket.readyState === WebSocket.OPEN) {
+          if (!geminiClientPromise) {
+            geminiClientPromise = initializeGemini();
+          }
+          if (message.media.payload) {
             const payload = message.media.payload;
-            const openaiEvent = {
-              type: 'input_audio_buffer.append',
-              audio: payload,
-            };
-            openaiSocket.send(JSON.stringify(openaiEvent));
+            geminiClientPromise?.then((client) => {
+              client?.sendAudioChunk(payload);
+            });
           }
         } else if (event === 'start' && message.start) {
           const sid = message.start.callSid || callSid || 'unknown';
           streamSid = message.start.streamSid || streamSid;
-          if (VERBOSE_OPENAI_LOGS) {
+          if (VERBOSE_GEMINI_LOGS) {
             console.log(`[Realtime] event=start callSid=${sid}`);
           }
           if (!currentRestaurant && message.start.customParameters && message.start.customParameters.restaurantId) {
@@ -223,18 +358,21 @@ export function attachRealtimeServer(server) {
               console.log('[Realtime] restaurant loaded from start.customParameters', { restaurantId: rid });
             });
           }
+          if (!geminiClientPromise) {
+            geminiClientPromise = initializeGemini();
+          }
         } else if (event === 'mark' && message.mark) {
           const name = message.mark.name || 'unknown';
-          if (VERBOSE_OPENAI_LOGS) {
+          if (VERBOSE_GEMINI_LOGS) {
             console.log(`[Realtime] event=mark name=${name}`);
           }
         } else if (event === 'stop') {
           const sid = callSid || 'unknown';
-          if (VERBOSE_OPENAI_LOGS) {
+          if (VERBOSE_GEMINI_LOGS) {
             console.log(`[Realtime] event=stop callSid=${sid}`);
           }
         } else {
-          if (VERBOSE_OPENAI_LOGS) {
+          if (VERBOSE_GEMINI_LOGS) {
             console.log(`[Realtime] event=${event}`);
           }
         }
@@ -242,206 +380,6 @@ export function attachRealtimeServer(server) {
         console.warn('[Realtime] Failed to parse Twilio message as JSON');
       }
     });
-
-    // Handle messages from OpenAI and forward audio deltas back to Twilio.
-    openaiSocket.on('message', async (data) => {
-      try {
-        const message = JSON.parse(data.toString());
-        const type = message.type;
-
-        // User has started speaking: cancel any in-flight response and stop audio.
-        if (type === 'input_audio_buffer.speech_started') {
-          if (VERBOSE_OPENAI_LOGS) {
-            console.log('[OpenAI] event=input_audio_buffer.speech_started');
-          }
-          userSpeaking = true;
-
-          if (streamSid && socket.readyState === WebSocket.OPEN) {
-            try {
-              socket.send(
-                JSON.stringify({
-                  event: 'clear',
-                  streamSid,
-                })
-              );
-              console.log('[Realtime] sent clear event to Twilio');
-            } catch (err) {
-              console.warn('[Realtime] failed to send clear event to Twilio', err);
-            }
-          }
-
-          if (activeResponse && currentResponseId && openaiSocket.readyState === WebSocket.OPEN) {
-            try {
-              openaiSocket.send(
-                JSON.stringify({
-                  type: 'response.cancel',
-                  response_id: currentResponseId,
-                })
-              );
-              console.log('[OpenAI] sent response.cancel for active response', currentResponseId);
-            } catch (err) {
-              console.warn('[OpenAI] failed to send response.cancel', err);
-            }
-          }
-
-          // Do not process any other handlers for this event.
-          return;
-        }
-
-        if (type === 'response.created' && message.response && message.response.id) {
-          currentResponseId = message.response.id;
-          activeResponse = true;
-          userSpeaking = false; // model is now speaking
-          if (VERBOSE_OPENAI_LOGS) {
-            console.log('[OpenAI] event=response.created id=', currentResponseId);
-          }
-        }
-
-        if (type === 'session.created' || type === 'session.updated') {
-          if (message.session && VERBOSE_OPENAI_LOGS) {
-            console.log('[OpenAI] session state:', JSON.stringify(message.session, null, 2));
-          }
-        }
-
-        if (type === 'response.function_call_arguments.delta') {
-          functionCallName = message.name || functionCallName;
-          functionCallId = message.call_id || message.id || functionCallId;
-          const delta = message.arguments || (message.delta && message.delta.arguments) || '';
-          if (delta) {
-            functionCallBuffer += delta;
-          }
-        }
-
-        if (type === 'response.function_call_arguments.done') {
-          const doneName = message.name || functionCallName;
-          const finalArgs =
-            (message.arguments || (message.delta && message.delta.arguments) || '') + functionCallBuffer;
-          if (doneName === 'submit_order' && finalArgs) {
-            try {
-              await restaurantReady;
-              const payload = JSON.parse(finalArgs);
-              lastSubmitOrderPayload = payload;
-              submitOrderCount += 1;
-              orderCompleted = true;
-              console.log('[Order Tool Payload]', JSON.stringify(payload, null, 2));
-              if (!currentRestaurant) {
-                console.error('[Order Tool Payload] missing restaurant context; skipping Firestore write');
-              }
-
-              // Send tool output back to the model so it can continue speaking.
-              if (functionCallId && openaiSocket.readyState === WebSocket.OPEN) {
-                const toolOutput = {
-                  type: 'conversation.item.create',
-                  item: {
-                    type: 'function_call_output',
-                    call_id: functionCallId,
-                    output: JSON.stringify(payload),
-                  },
-                };
-                const confirmationText = `Confirm once in a single short sentence the ${
-                  payload.fulfillmentType || 'pickup'
-                } order is placed${
-                  payload.deliveryAddress ? ` to ${payload.deliveryAddress}` : ''
-                }. No extra questions.`;
-                try {
-                  openaiSocket.send(JSON.stringify(toolOutput));
-                  openaiSocket.send(
-                    JSON.stringify({
-                      type: 'response.create',
-                      response: {
-                        instructions: confirmationText,
-                      },
-                    })
-                  );
-                } catch (err) {
-                  console.warn('[Order Tool Payload] failed to send tool output', err);
-                }
-              }
-
-            } catch (err) {
-              console.warn('[Order Tool Payload] failed to parse arguments', err);
-            }
-          }
-          functionCallBuffer = '';
-          functionCallName = null;
-          functionCallId = null;
-        }
-
-        if (type === 'conversation.item.input_audio_transcription.completed') {
-          const transcript =
-            message.transcript ||
-            (message.transcription && message.transcription.text) ||
-            message.transcription ||
-            (message.item && message.item.transcript) ||
-            (message.item && message.item.transcription);
-          if (transcript) {
-            orderLog.push({ from: 'user', text: String(transcript) });
-          }
-        }
-
-        if (type === 'response.output_text.delta' && message.delta) {
-          assistantTextBuffer += message.delta;
-        }
-
-        if (
-          (type === 'response.output_text.done' || type === 'response.done') &&
-          assistantTextBuffer.trim()
-        ) {
-          orderLog.push({ from: 'assistant', text: assistantTextBuffer.trim() });
-          assistantTextBuffer = '';
-        }
-
-        if (type === 'response.output_audio.delta' && message.delta) {
-          let audioChunk;
-          if (typeof message.delta === 'string') {
-            // GA realtime: delta is a base64-encoded audio string
-            audioChunk = message.delta;
-          } else if (message.delta.audio) {
-            // Backward compatibility if the audio is nested
-            audioChunk = message.delta.audio;
-          }
-
-          if (!audioChunk || !streamSid) return;
-
-          // If user has started speaking or response is no longer active, stop sending audio.
-          if (userSpeaking || !activeResponse) return;
-
-          const twilioMedia = {
-            event: 'media',
-            streamSid,
-            media: { payload: audioChunk },
-          };
-
-          if (socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify(twilioMedia));
-          }
-        } else if (
-          type === 'response.output_audio.done' ||
-          type === 'response.done' ||
-          type === 'response.cancelled'
-        ) {
-          activeResponse = false;
-          if (VERBOSE_OPENAI_LOGS) {
-            console.log('[OpenAI] event=response.end type=', type);
-          }
-        } else if (type === 'error') {
-          if (message.error && message.error.code === 'response_cancel_not_active') {
-            if (VERBOSE_OPENAI_LOGS) {
-              console.log('[OpenAI] cancel_not_active (safe to ignore)');
-            }
-          } else {
-            console.error('[OpenAI] error event payload:', JSON.stringify(message, null, 2));
-          }
-        } else {
-          if (VERBOSE_OPENAI_LOGS) {
-            console.log(`[OpenAI] event=${type}`);
-          }
-        }
-      } catch {
-        console.warn('[OpenAI] Failed to parse message as JSON');
-      }
-    });
-
     socket.on('close', async (code, reason) => {
       const reasonText = normalizeReason(reason);
       console.log('Twilio stream closed');
@@ -476,8 +414,10 @@ export function attachRealtimeServer(server) {
           itemCount: Array.isArray(lastSubmitOrderPayload.items) ? lastSubmitOrderPayload.items.length : 0,
         });
       }
-      if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
-        openaiSocket.close();
+      if (geminiClient) {
+        geminiClient.close();
+      } else if (geminiClientPromise) {
+        geminiClientPromise.then((client) => client?.close()).catch(() => {});
       }
     });
 
@@ -485,122 +425,6 @@ export function attachRealtimeServer(server) {
       console.error(`[Realtime] Twilio stream error${callSid ? ` (CallSid=${callSid})` : ''}:`, error);
     });
   });
-}
-
-export function connectToOpenAI() {
-  const apiKey = process.env.OPENAI_API_KEY;
-
-  if (!apiKey) {
-    console.warn('[OpenAI] OPENAI_API_KEY missing; cannot connect to Realtime API.');
-    return null;
-  }
-
-  console.log('[OpenAI] connecting');
-
-  const ws = new WebSocket(DEFAULT_REALTIME_ENDPOINT, {
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-  });
-
-  ws.on('open', () => {
-    console.log('[OpenAI] connected');
-
-    const fallbackInstructions = BASE_INSTRUCTIONS.replaceAll(
-      '{{RESTAURANT_NAME}}',
-      'the restaurant'
-    ).replaceAll('{{RESTAURANT_DESCRIPTION}}', 'neighborhood restaurant and takeout spot');
-
-    const sessionUpdate = {
-      type: 'session.update',
-      session: {
-        type: 'realtime',
-        model: 'gpt-realtime-mini',
-        output_modalities: ['audio'],
-        instructions: fallbackInstructions,
-        audio: {
-          input: {
-            format: { type: 'audio/pcmu' },
-            transcription: {
-              model: 'gpt-4o-transcribe',
-            },
-            turn_detection: {
-              type: 'server_vad',
-              threshold: 0.35,
-              prefix_padding_ms: 120,
-              silence_duration_ms: 150,
-              create_response: true,
-              interrupt_response: true,
-            },
-          },
-          output: {
-            format: { type: 'audio/pcmu' },
-            voice: 'sage',
-          },
-        },
-        tools: [
-          {
-            type: 'function',
-            name: 'submit_order',
-            description: 'Submit a confirmed order from this phone call.',
-            parameters: {
-              type: 'object',
-              properties: {
-                customerName: { type: 'string' },
-                customerPhone: { type: 'string' },
-                fulfillmentType: { type: 'string', enum: ['pickup', 'delivery'] },
-                deliveryAddress: {
-                  type: 'string',
-                  description: 'Full delivery street address including number and street name.',
-                },
-                deliveryApt: {
-                  type: 'string',
-                  description: 'Apartment, unit, or floor, if applicable.',
-                  nullable: true,
-                },
-                deliveryNotes: {
-                  type: 'string',
-                  description: 'Extra delivery notes or landmark info.',
-                  nullable: true,
-                },
-                items: {
-                  type: 'array',
-                  items: {
-                    type: 'object',
-                    properties: {
-                      name: { type: 'string' },
-                      quantity: { type: 'number' },
-                      notes: { type: 'string' },
-                    },
-                    required: ['name', 'quantity'],
-                    additionalProperties: false,
-                  },
-                },
-                notes: { type: 'string' },
-              },
-              required: ['customerName', 'customerPhone', 'fulfillmentType', 'items'],
-              additionalProperties: false,
-            },
-          },
-        ],
-      },
-    };
-
-    ws.send(JSON.stringify(sessionUpdate));
-  });
-
-  ws.on('close', () => {
-    if (VERBOSE_OPENAI_LOGS) {
-      console.log('[OpenAI] closed');
-    }
-  });
-
-  ws.on('error', (error) => {
-    console.error('[OpenAI] error', error);
-  });
-
-  return ws;
 }
 
 function normalizeReason(reason) {

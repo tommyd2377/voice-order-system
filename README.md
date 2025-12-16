@@ -1,18 +1,19 @@
-# GoLine Voice Order System (Day 1)
+# GoLine Voice Order System
 
-Day-1 MVP plumbing for the GoLine AI phone-order assistant.
+Twilio phone ordering assistant that bridges Twilio Media Streams ↔ Gemini Live ↔ Firestore. The agent greets callers, captures orders, streams audio both ways, and writes confirmed orders to Firestore.
 
 ## Prerequisites
-- Node.js 18+
-- npm
+- Node.js 20+
+- Twilio number with Voice <Stream> enabled
+- Firebase project with `restaurants` collection (docs keyed by restaurantId) and admin credentials
 
 ## Setup
-1. Copy `.env.example` to `.env` and fill in your secrets.
+1. Copy `.env.example` to `.env` and fill in secrets.
 2. Install dependencies:
    ```bash
    npm install
    ```
-3. Run the development server with live reload:
+3. Run the development server:
    ```bash
    npm run dev
    ```
@@ -21,35 +22,24 @@ Day-1 MVP plumbing for the GoLine AI phone-order assistant.
    npm start
    ```
 
+## Environment Variables
+- `GEMINI_API_KEY` (required) – Gemini API key for Live sessions
+- `GEMINI_LIVE_MODEL` (optional) – defaults to `gemini-live-2.5-flash-preview`
+- `GEMINI_LIVE_ENDPOINT` (optional) – override base URL if needed
+- `GEMINI_LIVE_VOICE` (optional) – prebuilt voice name
+- `TWILIO_STREAM_URL` – WebSocket URL Twilio connects to (e.g., `wss://your-domain/realtime`)
+- `FIREBASE_SERVICE_ACCOUNT_JSON` – service account JSON for Firestore (or use local `serviceAccountKey.json`)
+- `PORT` – HTTP port (default `8080`)
+
 ## Runtime Behavior
-- The Express server listens on `PORT` (default `8080`).
-- `POST /voice` returns TwiML instructing Twilio to open a `<Stream>` to `wss://YOUR_DOMAIN_HERE/realtime`.
-- A WebSocket server accepts connections at `ws://localhost:8080/realtime` and logs incoming media/control frames from Twilio.
-- `realtimeHandler.connectToRealtime()` stubs the OpenAI Realtime handshake and logs lifecycle events. No audio forwarding occurs on Day 1.
+- `POST /voice` looks up the restaurant by the Twilio number and returns TwiML that opens a `<Stream>` to `/realtime`, passing `restaurantId`.
+- `/realtime` WebSocket bridges Twilio audio (PCMU 8 kHz) to Gemini Live and streams Gemini audio back to Twilio.
+- Gemini Live provides server-side VAD for barge-in, transcription capture for order logs, and function calling for `submit_order`.
+- On call end, the last confirmed order payload is written to Firestore once.
 
-## Testing the Flow
-1. Expose the server using a tunnel such as `ngrok` and configure your Twilio number's Voice webhook to `POST https://<your-ngrok-domain>/voice`.
-2. Place a call to your Twilio number.
-3. You should hear silence (no greeting); Twilio immediately bridges audio to the backend WebSocket.
-4. Server logs will show WebSocket connect/disconnect events, payload summaries, and placeholder OpenAI Realtime logs.
-5. Pressing DTMF "0" is reserved for Day-2+ logic and currently only logs the intent.
+## Deployment
+- Set the environment variables above in your host (Railway, etc.).
+- Ensure `TWILIO_STREAM_URL` points at your public WebSocket endpoint (e.g., Railway domain).
+- Keep `GEMINI_API_KEY` and Firebase credentials in your service config; do not commit them.
 
-### Environment Variables
-
-Set the required keys in `.env`:
-
-```
-TWILIO_AUTH_TOKEN=
-OPENAI_API_KEY=
-PHONE_RELAY_NUMBER=
-PORT=8080
-```
-
-Optional overrides:
-
-```
-TWILIO_STREAM_URL=wss://YOUR_DOMAIN_HERE/realtime
-OPENAI_REALTIME_ENDPOINT=wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview
-```
-
-This scaffolding demonstrates the full telephony plumbing for the MVP without AI order handling or printing.
+More operational details live in `docs/gemini-live.md`.
