@@ -31,6 +31,12 @@ Twilio phone ordering assistant that bridges Twilio Media Streams ↔ Gemini Liv
 - `FIREBASE_SERVICE_ACCOUNT_JSON` – service account JSON for Firestore (or use local `serviceAccountKey.json`)
 - `PORT` – HTTP port (default `8080`)
 
+## Verifying Phone-Grade Audio Locally
+- Generate + convert a test tone: `npm run audio:test` (writes `samples/input.wav` if missing and outputs a temp `output_mulaw.wav`).
+- Inspect the output header: the script prints format info; ensure `rate: 8000`, `channels: 1`, `fmtTag: 7` (μ-law).
+- Run unit checks: `npm run test:audio` (resampler length, μ-law roundtrip tolerance, and 160-byte Twilio frames).
+- For manual listening, play `output_mulaw.wav` in a player that supports μ-law WAV or convert with `ffplay output_mulaw.wav`.
+
 ## Runtime Behavior
 - `POST /voice` looks up the restaurant by the Twilio number and returns TwiML that opens a `<Stream>` to `/realtime`, passing `restaurantId`.
 - `/realtime` WebSocket bridges Twilio audio (PCMU 8 kHz) to Gemini Live and streams Gemini audio back to Twilio.

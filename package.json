@@ -6,7 +6,9 @@
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "nodemon src/server.js"
+    "dev": "nodemon src/server.js",
+    "audio:test": "node scripts/audio-test.js",
+    "test:audio": "node --test tests/audio*.test.js"
   },
   "keywords": [
     "twilio",
@@ -20,10 +22,12 @@
   "license": "MIT",
   "dependencies": {
     "@google/genai": "^1.33.0",
+    "alawmulaw": "^6.0.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "firebase-admin": "^13.6.0",
     "twilio": "^4.21.0",
+    "wave-resampler": "^1.0.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {

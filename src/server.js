@@ -32,6 +32,34 @@ const db = admin.firestore();
 
 dotenv.config();
 
+const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
+const DEFAULT_GEMINI_ENDPOINT = 'https://generativelanguage.googleapis.com';
+const DEFAULT_WS_PATH = '/ws/google.ai.generativelanguage.v1beta.GenerativeService/BidiGenerateContent';
+const DEFAULT_GEMINI_VOICE = 'Puck';
+
+function cleanEnv(value) {
+  if (value === undefined || value === null) return undefined;
+  const trimmed = String(value).trim();
+  return trimmed.length ? trimmed : undefined;
+}
+
+const envModel = cleanEnv(process.env.GEMINI_LIVE_MODEL);
+const envEndpoint = cleanEnv(process.env.GEMINI_LIVE_ENDPOINT);
+const envVoice = cleanEnv(process.env.GEMINI_LIVE_VOICE);
+const resolvedModel = envModel || DEFAULT_GEMINI_MODEL;
+const resolvedEndpoint = envEndpoint || DEFAULT_GEMINI_ENDPOINT;
+const resolvedVoice = envVoice || DEFAULT_GEMINI_VOICE;
+const resolvedWebsocketUrl = `${resolvedEndpoint}${DEFAULT_WS_PATH}`;
+
+console.log('[Boot][Gemini] configuration', {
+  GEMINI_LIVE_MODEL: envModel || '(unset)',
+  GEMINI_LIVE_ENDPOINT: envEndpoint || '(unset)',
+  GEMINI_LIVE_VOICE: envVoice || '(unset)',
+  resolvedModel,
+  resolvedEndpoint,
+  resolvedWebsocketUrl,
+});
+
 const app = express();
 
 // Twilio sends webhook payloads as application/x-www-form-urlencoded.

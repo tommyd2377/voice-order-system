@@ -30,7 +30,7 @@ const DEBUG_TWILIO_STREAM = process.env.DEBUG_TWILIO_STREAM === 'true';
 const DEBUG_GEMINI_EVENTS = process.env.DEBUG_GEMINI_EVENTS === 'true';
 const DEBUG_AUDIO_STATS = process.env.DEBUG_AUDIO_STATS === 'true';
 const VERBOSE_GEMINI_LOGS = DEBUG_GEMINI_EVENTS || process.env.VERBOSE_GEMINI_LOGS === 'true';
-const DEFAULT_AUDIO_MIME_TYPE = 'audio/pcm;rate=8000';
+const DEFAULT_AUDIO_MIME_TYPE = 'audio/pcm;rate=16000';
 const BASE_INSTRUCTIONS = `
 You are the automated phone ordering assistant for {{RESTAURANT_NAME}}, a {{RESTAURANT_DESCRIPTION}}. You answer calls, take food orders, and enter them accurately into the system.
 
@@ -170,6 +170,9 @@ export function attachRealtimeServer(server) {
     let currentResponseId = 0;
     let lastCancelAck = false;
     let lastCancelRequestedAt = null;
+    let outboundAudioFrames = 0;
+    let outboundAudioBytes = 0;
+    let outboundFirstLogged = false;
 
     const bargePrefix = `[BARGE-IN][trace=${callTraceId}]`;
     const toolPrefix = `[TOOL][submit_order][trace=${callTraceId}]`;
@@ -307,6 +310,13 @@ export function attachRealtimeServer(server) {
         if (!chunk || !streamSid) return;
         if (userSpeaking) return;
         userSpeaking = false;
+        const payloadBytes = Buffer.from(chunk, 'base64').length || 0;
+        outboundAudioFrames += 1;
+        outboundAudioBytes += payloadBytes;
+        if (!outboundFirstLogged) {
+          outboundFirstLogged = true;
+          twilioLog('log', '[Twilio->caller] first outbound audio frame', { bytes: payloadBytes });
+        }
         const twilioMedia = {
           event: 'media',
           streamSid,
@@ -536,6 +546,8 @@ export function attachRealtimeServer(server) {
         totalFrames: twilioMediaFrames,
         firstMediaAtMs,
         startReceivedAtMs,
+        outboundAudioFrames,
+        outboundAudioBytes,
       });
       if (twilioMediaFrames === 0) {
         twilioLog('warn', 'Stream closed before any media was received');
