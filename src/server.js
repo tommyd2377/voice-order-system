@@ -67,6 +67,7 @@ app.post('/voice', async (req, res) => {
       <Connect>
         <Stream url="${streamUrl}" track="inbound_track">
           <Parameter name="restaurantId" value="${restaurantId}" />
+          <Parameter name="customerPhone" value="${req.body.From}" />
         </Stream>
       </Connect>
     </Response>

@@ -91,8 +91,8 @@ AFTER TOOL CALL
 `.trim();
 
 const DEFAULT_REALTIME_ENDPOINT =
-  process.env.OPENAI_REALTIME_ENDPOINT || 'wss://api.openai.com/v1/realtime?model=gpt-realtime';
-const DEFAULT_MODEL = 'gpt-realtime';
+  process.env.OPENAI_REALTIME_ENDPOINT || 'wss://api.openai.com/v1/realtime?model=gpt-realtime-mini';
+const DEFAULT_MODEL = 'gpt-realtime-mini';
 const DEFAULT_RESTAURANT_NAME = 'the restaurant';
 const DEFAULT_RESTAURANT_DESCRIPTION = 'neighborhood restaurant and takeout spot';
 const SUBMIT_ORDER_TOOL = {
@@ -139,14 +139,50 @@ const SUBMIT_ORDER_TOOL = {
   },
 };
 
-const buildInstructions = (restaurant) => {
+const buildInstructions = (restaurant, { hasDefaultPhone = false } = {}) => {
   const restaurantName = restaurant?.name || DEFAULT_RESTAURANT_NAME;
   const description = (restaurant?.shortDescription || DEFAULT_RESTAURANT_DESCRIPTION).trim();
 
-  return BASE_INSTRUCTIONS.replaceAll('{{RESTAURANT_NAME}}', restaurantName).replaceAll(
+  let instructions = BASE_INSTRUCTIONS.replaceAll('{{RESTAURANT_NAME}}', restaurantName).replaceAll(
     '{{RESTAURANT_DESCRIPTION}}',
     description
   );
+
+  if (hasDefaultPhone) {
+    instructions +=
+      '\nPHONE NUMBER: Caller phone is known from caller ID. NEVER ask for the phone number during the call. Only include the phone number in the single final confirmation.';
+  }
+
+  return instructions;
+};
+
+const INVALID_PHONE_VALUES = new Set([
+  '',
+  'caller id',
+  'callerid',
+  'unknown',
+  'n/a',
+  'na',
+  'none',
+  'null',
+  'undefined',
+  'caller',
+]);
+
+const cleanCustomerPhone = (value) => {
+  if (value == null) return null;
+  const trimmed = String(value).trim();
+  if (!trimmed) return null;
+  if (INVALID_PHONE_VALUES.has(trimmed.toLowerCase())) return null;
+  return trimmed;
+};
+
+const applyCustomerPhoneFallback = (payload, fallbackPhone) => {
+  const sanitized = { ...payload };
+  const normalizedPayloadPhone = cleanCustomerPhone(sanitized.customerPhone);
+  const normalizedFallback = cleanCustomerPhone(fallbackPhone);
+  sanitized.customerPhone = normalizedPayloadPhone || normalizedFallback || null;
+  return sanitized;
 };
 
 export function attachRealtimeServer(server) {
@@ -220,6 +256,23 @@ export function attachRealtimeServer(server) {
     let lastSubmitOrderPayload = null;
     let submitOrderCount = 0;
     let orderSubmitted = false;
+    let inferredCustomerPhone = null;
+    let callStartMs = Date.now();
+    let callEndMs = null;
+    let openaiUsageTotals = {
+      input_tokens: 0,
+      input_cached_tokens: 0,
+      input_uncached_tokens: 0,
+      input_audio_tokens: 0,
+      output_tokens: 0,
+      output_audio_tokens: 0,
+      model_requests: 0,
+    };
+    let startParamsResolved = false;
+    let resolveStartParams;
+    const startParamsReady = new Promise((resolve) => {
+      resolveStartParams = resolve;
+    });
 
     const resetFunctionCallState = () => {
       functionCallBuffer = '';
@@ -239,6 +292,13 @@ export function attachRealtimeServer(server) {
 
       if (!functionCallBuffer && message.arguments) {
         functionCallBuffer = message.arguments;
+      }
+    };
+
+    const markStartParamsReady = () => {
+      if (!startParamsResolved && resolveStartParams) {
+        startParamsResolved = true;
+        resolveStartParams();
       }
     };
 
@@ -294,9 +354,10 @@ export function attachRealtimeServer(server) {
       try {
         await restaurantReady;
         const payload = JSON.parse(functionCallBuffer);
-        lastSubmitOrderPayload = payload;
+        const sanitizedPayload = applyCustomerPhoneFallback(payload, inferredCustomerPhone);
+        lastSubmitOrderPayload = sanitizedPayload;
         submitOrderCount += 1;
-        console.log('[Order Tool Payload]', JSON.stringify(payload, null, 2));
+        console.log('[Order Tool Payload]', JSON.stringify(sanitizedPayload, null, 2));
         if (!currentRestaurant) {
           console.error('[Order Tool Payload] missing restaurant context; skipping Firestore write');
         }
@@ -307,12 +368,12 @@ export function attachRealtimeServer(server) {
             item: {
               type: 'function_call_output',
               call_id: functionCallId,
-              output: JSON.stringify(payload),
+              output: JSON.stringify(sanitizedPayload),
             },
           };
           const confirmationText = `Confirm once in a single short sentence the ${
-            payload.fulfillmentType || 'pickup'
-          } order is placed${payload.deliveryAddress ? ` to ${payload.deliveryAddress}` : ''}. No extra questions.`;
+            sanitizedPayload.fulfillmentType || 'pickup'
+          } order is placed${sanitizedPayload.deliveryAddress ? ` to ${sanitizedPayload.deliveryAddress}` : ''}. No extra questions.`;
           try {
             openaiSocket.send(JSON.stringify(toolOutput));
             openaiSocket.send(
@@ -351,9 +412,10 @@ export function attachRealtimeServer(server) {
     };
 
     openaiSocket.on('open', async () => {
-      await restaurantReady;
+      await Promise.all([restaurantReady, startParamsReady]);
 
-      const instructions = buildInstructions(currentRestaurant);
+      const hasDefaultPhone = Boolean(cleanCustomerPhone(inferredCustomerPhone));
+      const instructions = buildInstructions(currentRestaurant, { hasDefaultPhone });
       const restaurantName = currentRestaurant?.name || DEFAULT_RESTAURANT_NAME;
 
       console.log('[Realtime] applying restaurant instructions', {
@@ -405,12 +467,17 @@ export function attachRealtimeServer(server) {
               console.log(`[Realtime] event=start callSid=${sid}`);
             }
             streamSid = message.start?.streamSid || streamSid;
+            if (message.start?.customParameters?.customerPhone) {
+              inferredCustomerPhone = String(message.start.customParameters.customerPhone).trim();
+              console.log('[Realtime] inferred customer phone', inferredCustomerPhone);
+            }
             if (!currentRestaurant && message.start?.customParameters?.restaurantId) {
               const rid = message.start.customParameters.restaurantId;
               restaurantReady = loadRestaurantById(rid).then(() => {
                 console.log('[Realtime] restaurant loaded from start.customParameters', { restaurantId: rid });
               });
             }
+            markStartParamsReady();
             break;
           case 'mark':
             if (VERBOSE_OPENAI_LOGS) {
@@ -496,6 +563,23 @@ export function attachRealtimeServer(server) {
               console.log(`[OpenAI] event=${type}`);
             }
         }
+
+        const usage = message.response?.usage || message.usage;
+        if (usage && typeof usage === 'object') {
+          openaiUsageTotals.input_tokens += usage.input_tokens || 0;
+          openaiUsageTotals.output_tokens += usage.output_tokens || 0;
+          openaiUsageTotals.input_audio_tokens += usage.input_audio_tokens || 0;
+          openaiUsageTotals.output_audio_tokens += usage.output_audio_tokens || 0;
+
+          if (usage.input_cached_tokens != null) {
+            openaiUsageTotals.input_cached_tokens += usage.input_cached_tokens;
+          }
+          if (usage.input_uncached_tokens != null) {
+            openaiUsageTotals.input_uncached_tokens += usage.input_uncached_tokens;
+          }
+
+          openaiUsageTotals.model_requests += 1;
+        }
       } catch {
         console.warn('[OpenAI] Failed to parse message as JSON');
       }
@@ -505,12 +589,24 @@ export function attachRealtimeServer(server) {
     openaiSocket.on('message', handleOpenAiMessage);
 
     socket.on('close', async (code, reason) => {
+      callEndMs = Date.now();
+      const callDurationSeconds = Math.round((callEndMs - callStartMs) / 1000);
+      const analyticsPhone =
+        cleanCustomerPhone(lastSubmitOrderPayload?.customerPhone) || cleanCustomerPhone(inferredCustomerPhone) || null;
       const reasonText = normalizeReason(reason);
       console.log('Twilio stream closed');
       console.log(
         `[Realtime] Twilio stream closed${callSid ? ` (CallSid=${callSid})` : ''}: code=${code} reason=${reasonText}`
       );
       console.log('[Order Tool Count]', submitOrderCount);
+      const callAnalytics = {
+        callSid: callSid || null,
+        restaurantId: currentRestaurant?.id || null,
+        customerPhone: analyticsPhone,
+        callDurationSeconds,
+        openaiUsageTotals,
+        endedAt: new Date().toISOString(),
+      };
       if (lastSubmitOrderPayload && !orderSubmitted) {
         await restaurantReady;
         console.log('[Order Tool Payload @ End]', JSON.stringify(lastSubmitOrderPayload, null, 2));
@@ -521,7 +617,10 @@ export function attachRealtimeServer(server) {
             fulfillmentType: lastSubmitOrderPayload.fulfillmentType,
           });
           if (currentRestaurant) {
-            await submitOrderToFirebase(lastSubmitOrderPayload, currentRestaurant);
+            await submitOrderToFirebase(lastSubmitOrderPayload, currentRestaurant, {
+              callDurationSeconds,
+              openaiUsageTotals,
+            });
             orderSubmitted = true;
           } else {
             console.error('[Order] missing restaurant context at call end; skipping Firestore write');
@@ -537,7 +636,19 @@ export function attachRealtimeServer(server) {
           fulfillmentType: lastSubmitOrderPayload.fulfillmentType,
           itemCount: Array.isArray(lastSubmitOrderPayload.items) ? lastSubmitOrderPayload.items.length : 0,
         });
+      } else {
+        try {
+          await db.collection('call_logs').add(callAnalytics);
+        } catch (err) {
+          console.error('[Firebase] failed to write call log', err);
+        }
       }
+      console.log('[Call Analytics]', {
+        callSid: callSid || null,
+        customerPhone: analyticsPhone,
+        callDurationSeconds,
+        openaiUsageTotals,
+      });
       if (openaiSocket && openaiSocket.readyState === WebSocket.OPEN) {
         openaiSocket.close();
       }
@@ -632,7 +743,7 @@ function normalizeReason(reason) {
   return 'unknown';
 }
 
-async function submitOrderToFirebase(orderPayload, restaurant) {
+async function submitOrderToFirebase(orderPayload, restaurant, meta = {}) {
   try {
     const restaurantId = restaurant?.id || restaurant?.restaurantId;
     if (!restaurantId) {
@@ -662,6 +773,8 @@ async function submitOrderToFirebase(orderPayload, restaurant) {
       deliveryNotes: orderPayload.deliveryNotes || null,
       source: 'voice',
       notes: orderPayload.notes || null,
+      callDurationSeconds: meta?.callDurationSeconds || null,
+      openaiUsageTotals: meta?.openaiUsageTotals || null,
       items: (orderPayload.items || []).map((item) => ({
         menuItemId: item.menuItemId || null,
         name: item.name,
@@ -677,6 +790,7 @@ async function submitOrderToFirebase(orderPayload, restaurant) {
       totalCents: orderPayload.totalCents || 0,
       ticketSent: false,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      openaiUsageRecordedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
     const docRef = await db.collection('orders').add(orderForFirestore);
