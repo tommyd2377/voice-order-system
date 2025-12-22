@@ -1,93 +1,52 @@
 import WebSocket, { WebSocketServer } from 'ws';
 import { admin, db } from './firebase.js';
+import { resolveOrderPricing } from './menu/resolveOrderPricing.js';
 const VERBOSE_OPENAI_LOGS = process.env.VERBOSE_OPENAI_LOGS === 'true';
 const BASE_INSTRUCTIONS = `
 You are the automated phone ordering assistant for {{RESTAURANT_NAME}}, a {{RESTAURANT_DESCRIPTION}}. You answer calls, take food orders, and enter them accurately into the system.
 
 GLOBAL STYLE
 - Be concise and transactional; keep turns short.
-- Use simple, natural language, not corporate or robotic.
+- Use simple, natural language; no filler or small talk.
 - Ask only for information needed to place the order.
-- No small talk, no jokes, no stories.
 - Never explain that you are an AI unless the caller directly asks.
 
-CALL OPENING (DO THIS ONCE AT THE VERY START)
-At the beginning of the call, before asking anything else, say exactly:
-"Thanks for calling {{RESTAURANT_NAME}}. How can I help you?"
-Then stop and wait for the caller's answer.
-Do not repeat this greeting later in the call.
+CALL OPENING (DO THIS ONCE)
+Say exactly: "Thanks for calling {{RESTAURANT_NAME}}. I'm the automated assistant. Are you ordering for pickup or delivery?" Then stop and wait.
 
-FLEXIBLE ORDER HANDLING (NO FIXED ORDER)
-	•	The caller may provide information in any order (items first, delivery info later, etc.).
-	•	Accept and remember information whenever it is provided.
-	•	Do not force the conversation into a specific sequence.
-	•	If the caller starts by listing items, capture them immediately without interruption.
+COLLECTION RULES
+- Accept info in any order; never force a sequence.
+- Capture items immediately; do not read back items, modifiers, address, or phone while collecting.
+- Do NOT mention prices or totals during collection.
+- Ask only for missing required fields one at a time:
+  fulfillment, name, address (delivery only), items (qty/notes), and phone ONLY IF no default phone is available.
+- Do NOT call any menu/lookup tool during normal collection.
+- If the caller explicitly asks for a price, you may answer briefly once; otherwise wait to confirm totals at the end.
+- If the caller lists multiple items in one turn, treat it as a list and capture ALL items + quantities before asking anything. Do not respond mid-list. After you finish capturing, ask only: "Anything else?"
+- If you are missing quantity for any item, assume quantity=1 unless the caller implies otherwise.
 
-You must collect all required information by the end of the call, but the order does not matter.
+DEFAULT PHONE HANDLING (HARD RULE)
+- A default caller phone number may be available from caller ID.
+- If a default phone is available, treat PHONE as already collected.
+- NEVER ask “What’s your phone number?” or any variant.
+- Only ask for phone if the caller explicitly says they want to use a different number, or says the number on file is wrong.
+- Do not read any phone number aloud until the final confirmation.
 
-REQUIRED INFORMATION (COLLECT GRADUALLY)
+PRICING & VALIDATION
+- When you believe you have enough to confirm (fulfillment + items + name + phone + delivery info if needed), call resolve_order_pricing exactly once before final confirmation.
+- Use the resolver output to validate items and totals. Do not invent prices.
 
-By the end of the call, you must have:
-	•	Pickup or delivery
-	•	Customer name
-	•	Phone number
-	•	Delivery address (if delivery)
-	•	All order items with quantities and notes
+FINAL CONFIRMATION (ONLY ONCE)
+- If resolver output has unmatched items, ask one concise clarification with up to two suggestions; do not confirm yet.
+- Give one concise summary (fulfillment, name, phone, address if delivery, items...)
+- Include phone in the summary:
+  - if default phone is available, include it (but do not ask for it)
+  - otherwise include the caller-provided phone
+- Ask exactly: "Is everything correct?"
+- Only after a clear yes, call submit_order exactly once.
 
-Guidelines:
-	•	Ask only for missing information, one short question at a time.
-	•	Do not re-ask for information already provided.
-	•	Do not confirm or repeat details while collecting them.
-	•	Use short acknowledgements only (“Got it.”, “Okay.”).
-
-ORDER ITEMS
-	•	Capture each item’s name, quantity, and modifiers.
-	•	If something is unclear, ask one brief clarifying question.
-	•	Do not read items back during collection.
-	•	Do not confirm prices unless explicitly provided by a tool.
-
-FINAL CONFIRMATION (ONCE, AT THE END ONLY)
-
-When all required information is collected:
-	•	Give one concise summary including:
-	•	Pickup or delivery
-	•	Name
-	•	Phone number
-	•	Address (if delivery)
-	•	Full item list with quantities and key notes
-	•	If a total price is available, include it. Never invent prices.
-	•	Ask exactly:
-
-“Is everything correct?”
-
-If corrected:
-	•	Update the information
-	•	Repeat the single final confirmation once more
-	•	Then proceed
-
-STYLE RULES
-	•	Be curt, efficient, and transactional.
-	•	No filler, no repetition, no step-by-step narration.
-	•	Never confirm individual elements mid-call.
-	•	The confirmation happens only at the end.
-
-TOOL USE: submit_order
-- When the order is fully confirmed and you have:
-  - customer name
-  - customer phone
-  - fulfillment type (pickup or delivery)
-  - delivery address for delivery orders
-  - all items with quantities and notes
-- Then call the submit_order tool exactly once with the final data.
-- Do not call submit_order before the order is confirmed.
-- Do not call submit_order multiple times unless the caller clearly places a second, separate order.
-
-AFTER TOOL CALL
-- After the tool responds, give ONE short confirmation sentence such as:
-  "Your pickup order for [brief summary] is placed. It'll be ready in about [time if known or given]."
-- For delivery: "Your delivery order to [street or landmark only, not full address] is placed."
-- Do not ask new questions after the final confirmation.
-- End the call politely and succinctly, e.g., "Thank you for calling {{RESTAURANT_NAME}}."
+AFTER SUBMIT
+- After submit_order returns, say one short line like "Order received." No new questions.
 `.trim();
 
 const DEFAULT_REALTIME_ENDPOINT =
@@ -95,6 +54,36 @@ const DEFAULT_REALTIME_ENDPOINT =
 const DEFAULT_MODEL = 'gpt-realtime-mini';
 const DEFAULT_RESTAURANT_NAME = 'the restaurant';
 const DEFAULT_RESTAURANT_DESCRIPTION = 'neighborhood restaurant and takeout spot';
+const RESOLVE_ORDER_PRICING_TOOL = {
+  type: 'function',
+  name: 'resolve_order_pricing',
+  description: 'Resolve menu items and compute pricing for a draft order.',
+  parameters: {
+    type: 'object',
+    properties: {
+      restaurantId: { type: 'string' },
+      fulfillmentType: { type: 'string', enum: ['pickup', 'delivery'] },
+      deliveryAddress: { type: 'string', nullable: true },
+      deliveryApt: { type: 'string', nullable: true },
+      deliveryNotes: { type: 'string', nullable: true },
+      items: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            name: { type: 'string' },
+            quantity: { type: 'number' },
+            notes: { type: 'string' },
+          },
+          required: ['name', 'quantity'],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ['restaurantId', 'fulfillmentType', 'items'],
+    additionalProperties: false,
+  },
+};
 const SUBMIT_ORDER_TOOL = {
   type: 'function',
   name: 'submit_order',
@@ -254,11 +243,15 @@ export function attachRealtimeServer(server) {
     let functionCallName = null;
     let functionCallId = null;
     let lastSubmitOrderPayload = null;
+    let lastResolvedPricing = null;
     let submitOrderCount = 0;
     let orderSubmitted = false;
     let inferredCustomerPhone = null;
     let callStartMs = Date.now();
     let callEndMs = null;
+    let openaiReady = false;
+    let twilioStartReceived = false;
+    let sessionInitialized = false;
     let openaiUsageTotals = {
       input_tokens: 0,
       input_cached_tokens: 0,
@@ -268,11 +261,6 @@ export function attachRealtimeServer(server) {
       output_audio_tokens: 0,
       model_requests: 0,
     };
-    let startParamsResolved = false;
-    let resolveStartParams;
-    const startParamsReady = new Promise((resolve) => {
-      resolveStartParams = resolve;
-    });
 
     const resetFunctionCallState = () => {
       functionCallBuffer = '';
@@ -292,13 +280,6 @@ export function attachRealtimeServer(server) {
 
       if (!functionCallBuffer && message.arguments) {
         functionCallBuffer = message.arguments;
-      }
-    };
-
-    const markStartParamsReady = () => {
-      if (!startParamsResolved && resolveStartParams) {
-        startParamsResolved = true;
-        resolveStartParams();
       }
     };
 
@@ -346,50 +327,100 @@ export function attachRealtimeServer(server) {
     };
 
     const handleFunctionCallDone = async () => {
-      if (functionCallName !== 'submit_order' || !functionCallBuffer) {
+      if (!functionCallName || !functionCallBuffer) {
         resetFunctionCallState();
         return;
       }
 
       try {
         await restaurantReady;
-        const payload = JSON.parse(functionCallBuffer);
-        const sanitizedPayload = applyCustomerPhoneFallback(payload, inferredCustomerPhone);
-        lastSubmitOrderPayload = sanitizedPayload;
-        submitOrderCount += 1;
-        console.log('[Order Tool Payload]', JSON.stringify(sanitizedPayload, null, 2));
-        if (!currentRestaurant) {
-          console.error('[Order Tool Payload] missing restaurant context; skipping Firestore write');
+        const parsedArgs = JSON.parse(functionCallBuffer);
+
+        if (functionCallName === 'resolve_order_pricing') {
+          try {
+            const restaurantDocId =
+              currentRestaurant?.id || currentRestaurant?.restaurantId || parsedArgs.restaurantId;
+            const resolved = await resolveOrderPricing({
+              ...parsedArgs,
+              restaurantId: restaurantDocId,
+            });
+            lastResolvedPricing = resolved;
+            if (functionCallId && openaiSocket.readyState === WebSocket.OPEN) {
+              const toolOutput = {
+                type: 'conversation.item.create',
+                item: {
+                  type: 'function_call_output',
+                  call_id: functionCallId,
+                  output: JSON.stringify(resolved),
+                },
+              };
+              openaiSocket.send(JSON.stringify(toolOutput));
+              forceResponse(
+                'Use the pricing results to perform the single final confirmation. If unmatched items exist, ask one clarifying question with up to two suggestions; otherwise give the concise final summary with totals and ask "Is everything correct?" Do not call submit_order until the caller confirms yes.'
+              );
+            }
+          } catch (err) {
+            console.error('[Pricing] resolve_order_pricing failed', err);
+          }
+          resetFunctionCallState();
+          return;
         }
 
-        if (functionCallId && openaiSocket.readyState === WebSocket.OPEN) {
-          const toolOutput = {
-            type: 'conversation.item.create',
-            item: {
-              type: 'function_call_output',
-              call_id: functionCallId,
-              output: JSON.stringify(sanitizedPayload),
-            },
-          };
-          const confirmationText = `Confirm once in a single short sentence the ${
-            sanitizedPayload.fulfillmentType || 'pickup'
-          } order is placed${sanitizedPayload.deliveryAddress ? ` to ${sanitizedPayload.deliveryAddress}` : ''}. No extra questions.`;
-          try {
-            openaiSocket.send(JSON.stringify(toolOutput));
-            openaiSocket.send(
-              JSON.stringify({
-                type: 'response.create',
-                response: {
-                  instructions: confirmationText,
-                },
-              })
-            );
-          } catch (err) {
-            console.warn('[Order Tool Payload] failed to send tool output', err);
+        if (functionCallName === 'submit_order') {
+          const sanitizedPayload = applyCustomerPhoneFallback(parsedArgs, inferredCustomerPhone);
+          const pricingMatchesRestaurant =
+            lastResolvedPricing &&
+            lastResolvedPricing.restaurantId &&
+            (lastResolvedPricing.restaurantId === currentRestaurant?.id ||
+              lastResolvedPricing.restaurantId === currentRestaurant?.restaurantId ||
+              lastResolvedPricing.restaurantId === parsedArgs.restaurantId);
+
+          if (pricingMatchesRestaurant && lastResolvedPricing) {
+            sanitizedPayload.items = (lastResolvedPricing.resolvedItems || []).map((item) => ({
+              menuItemId: item.menuItemId || null,
+              name: item.name,
+              quantity: item.quantity || 1,
+              priceCents: item.priceCents ?? 0,
+              notes: item.notes || null,
+              specialInstructions: null,
+            }));
+            sanitizedPayload.subtotalCents =
+              lastResolvedPricing.subtotalCents ?? sanitizedPayload.subtotalCents ?? 0;
+            sanitizedPayload.taxCents =
+              lastResolvedPricing.taxCents ?? sanitizedPayload.taxCents ?? null;
+            sanitizedPayload.totalCents =
+              lastResolvedPricing.totalCents ??
+              (sanitizedPayload.subtotalCents || 0) + (sanitizedPayload.taxCents || 0);
           }
+
+          lastSubmitOrderPayload = sanitizedPayload;
+          submitOrderCount += 1;
+          console.log('[Order Tool Payload]', JSON.stringify(sanitizedPayload, null, 2));
+          if (!currentRestaurant) {
+            console.error('[Order Tool Payload] missing restaurant context; skipping Firestore write');
+          }
+
+          if (functionCallId && openaiSocket.readyState === WebSocket.OPEN) {
+            const toolOutput = {
+              type: 'conversation.item.create',
+              item: {
+                type: 'function_call_output',
+                call_id: functionCallId,
+                output: JSON.stringify(sanitizedPayload),
+              },
+            };
+            try {
+              openaiSocket.send(JSON.stringify(toolOutput));
+              forceResponse('Order received.');
+            } catch (err) {
+              console.warn('[Order Tool Payload] failed to send tool output', err);
+            }
+          }
+          resetFunctionCallState();
+          return;
         }
       } catch (err) {
-        console.warn('[Order Tool Payload] failed to parse arguments', err);
+        console.warn('[Function Call] failed to process arguments', err);
       }
 
       resetFunctionCallState();
@@ -411,17 +442,30 @@ export function attachRealtimeServer(server) {
       }
     };
 
-    openaiSocket.on('open', async () => {
-      await Promise.all([restaurantReady, startParamsReady]);
+    const forceResponse = (instructionsText) => {
+      if (openaiSocket.readyState !== WebSocket.OPEN) return;
+      openaiSocket.send(
+        JSON.stringify({
+          type: 'response.create',
+          response: {
+            instructions: instructionsText,
+          },
+        })
+      );
+      activeResponse = true;
+    };
+
+    const maybeInitSession = async () => {
+      if (sessionInitialized || !openaiReady || !twilioStartReceived) return;
+      await restaurantReady;
 
       const hasDefaultPhone = Boolean(cleanCustomerPhone(inferredCustomerPhone));
       const instructions = buildInstructions(currentRestaurant, { hasDefaultPhone });
       const restaurantName = currentRestaurant?.name || DEFAULT_RESTAURANT_NAME;
 
-      console.log('[Realtime] applying restaurant instructions', {
-        restaurantId: currentRestaurant?.id,
-        restaurantName,
-      });
+      if (openaiSocket.readyState !== WebSocket.OPEN) {
+        return;
+      }
 
       openaiSocket.send(
         JSON.stringify({
@@ -443,6 +487,25 @@ export function attachRealtimeServer(server) {
           },
         })
       );
+
+      sessionInitialized = true;
+      const phoneLast4 = cleanCustomerPhone(inferredCustomerPhone)?.slice(-4) || null;
+      console.log('[Realtime] session initialized', {
+        restaurantId: currentRestaurant?.id || currentRestaurant?.restaurantId || null,
+        hasDefaultPhone,
+        callerPhoneLast4: phoneLast4,
+      });
+    };
+
+    openaiSocket.on('open', () => {
+      openaiReady = true;
+      maybeInitSession();
+      setTimeout(() => {
+        if (!twilioStartReceived) {
+          twilioStartReceived = true;
+          maybeInitSession();
+        }
+      }, 1500);
     });
 
     const handleTwilioMessage = (data, isBinary) => {
@@ -477,7 +540,8 @@ export function attachRealtimeServer(server) {
                 console.log('[Realtime] restaurant loaded from start.customParameters', { restaurantId: rid });
               });
             }
-            markStartParamsReady();
+            twilioStartReceived = true;
+            maybeInitSession();
             break;
           case 'mark':
             if (VERBOSE_OPENAI_LOGS) {
@@ -512,6 +576,18 @@ export function attachRealtimeServer(server) {
           case 'input_audio_buffer.speech_started':
             handleSpeechStarted();
             return;
+          case 'conversation.item.input_audio_transcription.completed': {
+            const transcript =
+              message.transcript ||
+              message.transcription?.text ||
+              message.transcription ||
+              message.item?.transcript ||
+              message.item?.transcription;
+            if (transcript && VERBOSE_OPENAI_LOGS) {
+              console.log('[ASR]', { chars: String(transcript).length, text: transcript });
+            }
+            break;
+          }
           case 'response.created':
             currentResponseId = message.response?.id || currentResponseId;
             activeResponse = true;
@@ -697,9 +773,9 @@ export function connectToOpenAI() {
             },
             turn_detection: {
               type: 'server_vad',
-              threshold: 0.65,
-              prefix_padding_ms: 120,
-              silence_duration_ms: 150,
+              threshold: 0.45,
+              prefix_padding_ms: 200,
+              silence_duration_ms: 1100,
               create_response: true,
               interrupt_response: true,
             },
@@ -709,7 +785,7 @@ export function connectToOpenAI() {
             voice: 'sage',
           },
         },
-        tools: [SUBMIT_ORDER_TOOL],
+        tools: [RESOLVE_ORDER_PRICING_TOOL, SUBMIT_ORDER_TOOL],
       },
     };
 
